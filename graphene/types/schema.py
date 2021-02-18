@@ -7,10 +7,14 @@ from graphql import (
     graphql,
     graphql_sync,
     introspection_types,
-    is_type,
+    parse,
     print_schema,
+    subscribe,
+    validate,
+    ExecutionResult,
     GraphQLArgument,
     GraphQLBoolean,
+    GraphQLError,
     GraphQLEnumValue,
     GraphQLField,
     GraphQLFloat,
@@ -22,8 +26,10 @@ from graphql import (
     GraphQLObjectType,
     GraphQLSchema,
     GraphQLString,
-    INVALID,
+    Undefined,
 )
+from graphql.execution import ExecutionContext
+from graphql.execution.values import get_argument_values
 
 from ..utils.str_converters import to_camel_case
 from ..utils.get_unbound_function import get_unbound_function
@@ -57,9 +63,9 @@ def assert_valid_root_type(type_):
         return
     is_graphene_objecttype = inspect.isclass(type_) and issubclass(type_, ObjectType)
     is_graphql_objecttype = isinstance(type_, GraphQLObjectType)
-    assert is_graphene_objecttype or is_graphql_objecttype, (
-        "Type {} is not a valid ObjectType."
-    ).format(type_)
+    assert (
+        is_graphene_objecttype or is_graphql_objecttype
+    ), f"Type {type_} is not a valid ObjectType."
 
 
 def is_graphene_type(type_):
@@ -71,118 +77,75 @@ def is_graphene_type(type_):
         return True
 
 
-def resolve_type(resolve_type_func, map_, type_name, root, info, _type):
-    type_ = resolve_type_func(root, info)
-
-    if not type_:
-        return_type = map_[type_name]
-        return default_type_resolver(root, info, return_type)
-
-    if inspect.isclass(type_) and issubclass(type_, ObjectType):
-        graphql_type = map_.get(type_._meta.name)
-        assert graphql_type, "Can't find type {} in schema".format(type_._meta.name)
-        assert graphql_type.graphene_type == type_, (
-            "The type {} does not match with the associated graphene type {}."
-        ).format(type_, graphql_type.graphene_type)
-        return graphql_type
-
-    return type_
-
-
 def is_type_of_from_possible_types(possible_types, root, _info):
     return isinstance(root, possible_types)
 
 
-class GrapheneGraphQLSchema(GraphQLSchema):
-    """A GraphQLSchema that can deal with Graphene types as well."""
+# We use this resolver for subscriptions
+def identity_resolve(root, info, **arguments):
+    return root
 
+
+class TypeMap(dict):
     def __init__(
         self,
         query=None,
         mutation=None,
         subscription=None,
         types=None,
-        directives=None,
         auto_camelcase=True,
     ):
         assert_valid_root_type(query)
         assert_valid_root_type(mutation)
         assert_valid_root_type(subscription)
+        if types is None:
+            types = []
+        for type_ in types:
+            assert is_graphene_type(type_)
 
         self.auto_camelcase = auto_camelcase
-        super().__init__(query, mutation, subscription, types, directives)
 
-        if query:
-            self.query_type = self.get_type(
-                query.name if isinstance(query, GraphQLObjectType) else query._meta.name
-            )
-        if mutation:
-            self.mutation_type = self.get_type(
-                mutation.name
-                if isinstance(mutation, GraphQLObjectType)
-                else mutation._meta.name
-            )
-        if subscription:
-            self.subscription_type = self.get_type(
-                subscription.name
-                if isinstance(subscription, GraphQLObjectType)
-                else subscription._meta.name
-            )
+        create_graphql_type = self.add_type
 
-    def get_graphql_type(self, _type):
-        if not _type:
-            return _type
-        if is_type(_type):
-            return _type
-        if is_graphene_type(_type):
-            graphql_type = self.get_type(_type._meta.name)
-            assert graphql_type, "Type {} not found in this schema.".format(
-                _type._meta.name
-            )
-            assert graphql_type.graphene_type == _type
+        self.query = create_graphql_type(query) if query else None
+        self.mutation = create_graphql_type(mutation) if mutation else None
+        self.subscription = create_graphql_type(subscription) if subscription else None
+
+        self.types = [create_graphql_type(graphene_type) for graphene_type in types]
+
+    def add_type(self, graphene_type):
+        if inspect.isfunction(graphene_type):
+            graphene_type = graphene_type()
+        if isinstance(graphene_type, List):
+            return GraphQLList(self.add_type(graphene_type.of_type))
+        if isinstance(graphene_type, NonNull):
+            return GraphQLNonNull(self.add_type(graphene_type.of_type))
+        try:
+            name = graphene_type._meta.name
+        except AttributeError:
+            raise TypeError(f"Expected Graphene type, but received: {graphene_type}.")
+        graphql_type = self.get(name)
+        if graphql_type:
             return graphql_type
-        raise Exception("{} is not a valid GraphQL type.".format(_type))
-
-    # noinspection PyMethodOverriding
-    def type_map_reducer(self, map_, type_):
-        if not type_:
-            return map_
-        if inspect.isfunction(type_):
-            type_ = type_()
-        if is_graphene_type(type_):
-            return self.graphene_reducer(map_, type_)
-        return super().type_map_reducer(map_, type_)
-
-    def graphene_reducer(self, map_, type_):
-        if isinstance(type_, (List, NonNull)):
-            return self.type_map_reducer(map_, type_.of_type)
-        if type_._meta.name in map_:
-            _type = map_[type_._meta.name]
-            if isinstance(_type, GrapheneGraphQLType):
-                assert _type.graphene_type == type_, (
-                    "Found different types with the same name in the schema: {}, {}."
-                ).format(_type.graphene_type, type_)
-            return map_
-
-        if issubclass(type_, ObjectType):
-            internal_type = self.construct_objecttype(map_, type_)
-        elif issubclass(type_, InputObjectType):
-            internal_type = self.construct_inputobjecttype(map_, type_)
-        elif issubclass(type_, Interface):
-            internal_type = self.construct_interface(map_, type_)
-        elif issubclass(type_, Scalar):
-            internal_type = self.construct_scalar(type_)
-        elif issubclass(type_, Enum):
-            internal_type = self.construct_enum(type_)
-        elif issubclass(type_, Union):
-            internal_type = self.construct_union(map_, type_)
+        if issubclass(graphene_type, ObjectType):
+            graphql_type = self.create_objecttype(graphene_type)
+        elif issubclass(graphene_type, InputObjectType):
+            graphql_type = self.create_inputobjecttype(graphene_type)
+        elif issubclass(graphene_type, Interface):
+            graphql_type = self.create_interface(graphene_type)
+        elif issubclass(graphene_type, Scalar):
+            graphql_type = self.create_scalar(graphene_type)
+        elif issubclass(graphene_type, Enum):
+            graphql_type = self.create_enum(graphene_type)
+        elif issubclass(graphene_type, Union):
+            graphql_type = self.construct_union(graphene_type)
         else:
-            raise Exception("Expected Graphene type, but received: {}.".format(type_))
-
-        return super().type_map_reducer(map_, internal_type)
+            raise TypeError(f"Expected Graphene type, but received: {graphene_type}.")
+        self[name] = graphql_type
+        return graphql_type
 
     @staticmethod
-    def construct_scalar(type_):
+    def create_scalar(graphene_type):
         # We have a mapping to the original GraphQL types
         # so there are no collisions.
         _scalars = {
@@ -192,138 +155,131 @@ class GrapheneGraphQLSchema(GraphQLSchema):
             Boolean: GraphQLBoolean,
             ID: GraphQLID,
         }
-        if type_ in _scalars:
-            return _scalars[type_]
+        if graphene_type in _scalars:
+            return _scalars[graphene_type]
 
         return GrapheneScalarType(
-            graphene_type=type_,
-            name=type_._meta.name,
-            description=type_._meta.description,
-            serialize=getattr(type_, "serialize", None),
-            parse_value=getattr(type_, "parse_value", None),
-            parse_literal=getattr(type_, "parse_literal", None),
+            graphene_type=graphene_type,
+            name=graphene_type._meta.name,
+            description=graphene_type._meta.description,
+            serialize=getattr(graphene_type, "serialize", None),
+            parse_value=getattr(graphene_type, "parse_value", None),
+            parse_literal=getattr(graphene_type, "parse_literal", None),
         )
 
     @staticmethod
-    def construct_enum(type_):
+    def create_enum(graphene_type):
         values = {}
-        for name, value in type_._meta.enum.__members__.items():
+        for name, value in graphene_type._meta.enum.__members__.items():
             description = getattr(value, "description", None)
             deprecation_reason = getattr(value, "deprecation_reason", None)
-            if not description and callable(type_._meta.description):
-                description = type_._meta.description(value)
+            if not description and callable(graphene_type._meta.description):
+                description = graphene_type._meta.description(value)
 
-            if not deprecation_reason and callable(type_._meta.deprecation_reason):
-                deprecation_reason = type_._meta.deprecation_reason(value)
+            if not deprecation_reason and callable(
+                graphene_type._meta.deprecation_reason
+            ):
+                deprecation_reason = graphene_type._meta.deprecation_reason(value)
 
             values[name] = GraphQLEnumValue(
-                value=value.value,
+                value=value,
                 description=description,
                 deprecation_reason=deprecation_reason,
             )
 
         type_description = (
-            type_._meta.description(None)
-            if callable(type_._meta.description)
-            else type_._meta.description
+            graphene_type._meta.description(None)
+            if callable(graphene_type._meta.description)
+            else graphene_type._meta.description
         )
 
         return GrapheneEnumType(
-            graphene_type=type_,
+            graphene_type=graphene_type,
             values=values,
-            name=type_._meta.name,
+            name=graphene_type._meta.name,
             description=type_description,
         )
 
-    def construct_objecttype(self, map_, type_):
-        if type_._meta.name in map_:
-            _type = map_[type_._meta.name]
-            if isinstance(_type, GrapheneGraphQLType):
-                assert _type.graphene_type == type_, (
-                    "Found different types with the same name in the schema: {}, {}."
-                ).format(_type.graphene_type, type_)
-            return _type
+    def create_objecttype(self, graphene_type):
+        create_graphql_type = self.add_type
 
         def interfaces():
             interfaces = []
-            for interface in type_._meta.interfaces:
-                self.graphene_reducer(map_, interface)
-                internal_type = map_[interface._meta.name]
-                assert internal_type.graphene_type == interface
-                interfaces.append(internal_type)
+            for graphene_interface in graphene_type._meta.interfaces:
+                interface = create_graphql_type(graphene_interface)
+                assert interface.graphene_type == graphene_interface
+                interfaces.append(interface)
             return interfaces
 
-        if type_._meta.possible_types:
+        if graphene_type._meta.possible_types:
             is_type_of = partial(
-                is_type_of_from_possible_types, type_._meta.possible_types
+                is_type_of_from_possible_types, graphene_type._meta.possible_types
             )
         else:
-            is_type_of = type_.is_type_of
+            is_type_of = graphene_type.is_type_of
 
         return GrapheneObjectType(
-            graphene_type=type_,
-            name=type_._meta.name,
-            description=type_._meta.description,
-            fields=partial(self.construct_fields_for_type, map_, type_),
+            graphene_type=graphene_type,
+            name=graphene_type._meta.name,
+            description=graphene_type._meta.description,
+            fields=partial(self.create_fields_for_type, graphene_type),
             is_type_of=is_type_of,
             interfaces=interfaces,
         )
 
-    def construct_interface(self, map_, type_):
-        if type_._meta.name in map_:
-            _type = map_[type_._meta.name]
-            if isinstance(_type, GrapheneInterfaceType):
-                assert _type.graphene_type == type_, (
-                    "Found different types with the same name in the schema: {}, {}."
-                ).format(_type.graphene_type, type_)
-            return _type
-
-        _resolve_type = None
-        if type_.resolve_type:
-            _resolve_type = partial(
-                resolve_type, type_.resolve_type, map_, type_._meta.name
+    def create_interface(self, graphene_type):
+        resolve_type = (
+            partial(
+                self.resolve_type, graphene_type.resolve_type, graphene_type._meta.name
             )
-        return GrapheneInterfaceType(
-            graphene_type=type_,
-            name=type_._meta.name,
-            description=type_._meta.description,
-            fields=partial(self.construct_fields_for_type, map_, type_),
-            resolve_type=_resolve_type,
+            if graphene_type.resolve_type
+            else None
         )
 
-    def construct_inputobjecttype(self, map_, type_):
+        return GrapheneInterfaceType(
+            graphene_type=graphene_type,
+            name=graphene_type._meta.name,
+            description=graphene_type._meta.description,
+            fields=partial(self.create_fields_for_type, graphene_type),
+            resolve_type=resolve_type,
+        )
+
+    def create_inputobjecttype(self, graphene_type):
         return GrapheneInputObjectType(
-            graphene_type=type_,
-            name=type_._meta.name,
-            description=type_._meta.description,
-            out_type=type_._meta.container,
+            graphene_type=graphene_type,
+            name=graphene_type._meta.name,
+            description=graphene_type._meta.description,
+            out_type=graphene_type._meta.container,
             fields=partial(
-                self.construct_fields_for_type, map_, type_, is_input_type=True
+                self.create_fields_for_type, graphene_type, is_input_type=True
             ),
         )
 
-    def construct_union(self, map_, type_):
-        _resolve_type = None
-        if type_.resolve_type:
-            _resolve_type = partial(
-                resolve_type, type_.resolve_type, map_, type_._meta.name
-            )
+    def construct_union(self, graphene_type):
+        create_graphql_type = self.add_type
 
         def types():
             union_types = []
-            for objecttype in type_._meta.types:
-                self.graphene_reducer(map_, objecttype)
-                internal_type = map_[objecttype._meta.name]
-                assert internal_type.graphene_type == objecttype
-                union_types.append(internal_type)
+            for graphene_objecttype in graphene_type._meta.types:
+                object_type = create_graphql_type(graphene_objecttype)
+                assert object_type.graphene_type == graphene_objecttype
+                union_types.append(object_type)
             return union_types
 
+        resolve_type = (
+            partial(
+                self.resolve_type, graphene_type.resolve_type, graphene_type._meta.name
+            )
+            if graphene_type.resolve_type
+            else None
+        )
+
         return GrapheneUnionType(
-            graphene_type=type_,
-            name=type_._meta.name,
-            description=type_._meta.description,
+            graphene_type=graphene_type,
+            name=graphene_type._meta.name,
+            description=graphene_type._meta.description,
             types=types,
-            resolve_type=_resolve_type,
+            resolve_type=resolve_type,
         )
 
     def get_name(self, name):
@@ -331,15 +287,16 @@ class GrapheneGraphQLSchema(GraphQLSchema):
             return to_camel_case(name)
         return name
 
-    def construct_fields_for_type(self, map_, type_, is_input_type=False):
+    def create_fields_for_type(self, graphene_type, is_input_type=False):
+        create_graphql_type = self.add_type
+
         fields = {}
-        for name, field in type_._meta.fields.items():
+        for name, field in graphene_type._meta.fields.items():
             if isinstance(field, Dynamic):
                 field = get_field_as(field.get_type(self), _as=Field)
                 if not field:
                     continue
-            map_ = self.type_map_reducer(map_, field.type)
-            field_type = self.get_field_type(map_, field.type)
+            field_type = create_graphql_type(field.type)
             if is_input_type:
                 _field = GraphQLInputField(
                     field_type,
@@ -350,23 +307,49 @@ class GrapheneGraphQLSchema(GraphQLSchema):
             else:
                 args = {}
                 for arg_name, arg in field.args.items():
-                    map_ = self.type_map_reducer(map_, arg.type)
-                    arg_type = self.get_field_type(map_, arg.type)
+                    arg_type = create_graphql_type(arg.type)
                     processed_arg_name = arg.name or self.get_name(arg_name)
                     args[processed_arg_name] = GraphQLArgument(
                         arg_type,
                         out_name=arg_name,
                         description=arg.description,
-                        default_value=INVALID
+                        default_value=Undefined
                         if isinstance(arg.type, NonNull)
                         else arg.default_value,
                     )
+                subscribe = field.wrap_subscribe(
+                    self.get_function_for_type(
+                        graphene_type, f"subscribe_{name}", name, field.default_value
+                    )
+                )
+
+                # If we are in a subscription, we use (by default) an
+                # identity-based resolver for the root, rather than the
+                # default resolver for objects/dicts.
+                if subscribe:
+                    field_default_resolver = identity_resolve
+                elif issubclass(graphene_type, ObjectType):
+                    default_resolver = (
+                        graphene_type._meta.default_resolver or get_default_resolver()
+                    )
+                    field_default_resolver = partial(
+                        default_resolver, name, field.default_value
+                    )
+                else:
+                    field_default_resolver = None
+
+                resolve = field.wrap_resolve(
+                    self.get_function_for_type(
+                        graphene_type, f"resolve_{name}", name, field.default_value
+                    )
+                    or field_default_resolver
+                )
+
                 _field = GraphQLField(
                     field_type,
                     args=args,
-                    resolve=field.get_resolver(
-                        self.get_resolver_for_type(type_, name, field.default_value)
-                    ),
+                    resolve=resolve,
+                    subscribe=subscribe,
                     deprecation_reason=field.deprecation_reason,
                     description=field.description,
                 )
@@ -374,18 +357,19 @@ class GrapheneGraphQLSchema(GraphQLSchema):
             fields[field_name] = _field
         return fields
 
-    def get_resolver_for_type(self, type_, name, default_value):
-        if not issubclass(type_, ObjectType):
+    def get_function_for_type(self, graphene_type, func_name, name, default_value):
+        """Gets a resolve or subscribe function for a given ObjectType"""
+        if not issubclass(graphene_type, ObjectType):
             return
-        resolver = getattr(type_, "resolve_{}".format(name), None)
+        resolver = getattr(graphene_type, func_name, None)
         if not resolver:
             # If we don't find the resolver in the ObjectType class, then try to
             # find it in each of the interfaces
             interface_resolver = None
-            for interface in type_._meta.interfaces:
+            for interface in graphene_type._meta.interfaces:
                 if name not in interface._meta.fields:
                     continue
-                interface_resolver = getattr(interface, "resolve_{}".format(name), None)
+                interface_resolver = getattr(interface, func_name, None)
                 if interface_resolver:
                     break
             resolver = interface_resolver
@@ -394,15 +378,117 @@ class GrapheneGraphQLSchema(GraphQLSchema):
         if resolver:
             return get_unbound_function(resolver)
 
-        default_resolver = type_._meta.default_resolver or get_default_resolver()
-        return partial(default_resolver, name, default_value)
+    def resolve_type(self, resolve_type_func, type_name, root, info, _type):
+        type_ = resolve_type_func(root, info)
 
-    def get_field_type(self, map_, type_):
-        if isinstance(type_, List):
-            return GraphQLList(self.get_field_type(map_, type_.of_type))
-        if isinstance(type_, NonNull):
-            return GraphQLNonNull(self.get_field_type(map_, type_.of_type))
-        return map_.get(type_._meta.name)
+        if not type_:
+            return_type = self[type_name]
+            return default_type_resolver(root, info, return_type)
+
+        if inspect.isclass(type_) and issubclass(type_, ObjectType):
+            graphql_type = self.get(type_._meta.name)
+            assert graphql_type, f"Can't find type {type_._meta.name} in schema"
+            assert (
+                graphql_type.graphene_type == type_
+            ), f"The type {type_} does not match with the associated graphene type {graphql_type.graphene_type}."
+            return graphql_type
+
+        return type_
+
+
+class UnforgivingExecutionContext(ExecutionContext):
+    """An execution context which doesn't swallow exceptions.
+
+    The only difference between this execution context and the one it inherits from is
+    that ``except Exception`` is commented out within ``resolve_field_value_or_error``.
+    By removing that exception handling, only ``GraphQLError``'s are caught.
+    """
+
+    def resolve_field_value_or_error(
+        self, field_def, field_nodes, resolve_fn, source, info
+    ):
+        """Resolve field to a value or an error.
+
+        Isolates the "ReturnOrAbrupt" behavior to not de-opt the resolve_field()
+        method. Returns the result of resolveFn or the abrupt-return Error object.
+
+        For internal use only.
+        """
+        try:
+            # Build a dictionary of arguments from the field.arguments AST, using the
+            # variables scope to fulfill any variable references.
+            args = get_argument_values(field_def, field_nodes[0], self.variable_values)
+
+            # Note that contrary to the JavaScript implementation, we pass the context
+            # value as part of the resolve info.
+            result = resolve_fn(source, info, **args)
+            if self.is_awaitable(result):
+                # noinspection PyShadowingNames
+                async def await_result():
+                    try:
+                        return await result
+                    except GraphQLError as error:
+                        return error
+                    # except Exception as error:
+                    #     return GraphQLError(str(error), original_error=error)
+
+                    # Yes, this is commented out code. It's been intentionally
+                    # _not_ removed to show what has changed from the original
+                    # implementation.
+
+                return await_result()
+            return result
+        except GraphQLError as error:
+            return error
+        # except Exception as error:
+        #     return GraphQLError(str(error), original_error=error)
+
+        # Yes, this is commented out code. It's been intentionally _not_
+        # removed to show what has changed from the original implementation.
+
+    def complete_value_catching_error(
+        self, return_type, field_nodes, info, path, result
+    ):
+        """Complete a value while catching an error.
+
+        This is a small wrapper around completeValue which detects and logs errors in
+        the execution context.
+        """
+        try:
+            if self.is_awaitable(result):
+
+                async def await_result():
+                    value = self.complete_value(
+                        return_type, field_nodes, info, path, await result
+                    )
+                    if self.is_awaitable(value):
+                        return await value
+                    return value
+
+                completed = await_result()
+            else:
+                completed = self.complete_value(
+                    return_type, field_nodes, info, path, result
+                )
+            if self.is_awaitable(completed):
+                # noinspection PyShadowingNames
+                async def await_completed():
+                    try:
+                        return await completed
+
+                    # CHANGE WAS MADE HERE
+                    # ``GraphQLError`` was swapped in for ``except Exception``
+                    except GraphQLError as error:
+                        self.handle_field_error(error, field_nodes, path, return_type)
+
+                return await_completed()
+            return completed
+
+        # CHANGE WAS MADE HERE
+        # ``GraphQLError`` was swapped in for ``except Exception``
+        except GraphQLError as error:
+            self.handle_field_error(error, field_nodes, path, return_type)
+            return None
 
 
 class Schema:
@@ -413,17 +499,17 @@ class Schema:
     questions about the types through introspection.
 
     Args:
-        query (ObjectType): Root query *ObjectType*. Describes entry point for fields to *read*
+        query (Type[ObjectType]): Root query *ObjectType*. Describes entry point for fields to *read*
             data in your Schema.
-        mutation (ObjectType, optional): Root mutation *ObjectType*. Describes entry point for
+        mutation (Optional[Type[ObjectType]]): Root mutation *ObjectType*. Describes entry point for
             fields to *create, update or delete* data in your API.
-        subscription (ObjectType, optional): Root subscription *ObjectType*. Describes entry point
+        subscription (Optional[Type[ObjectType]]): Root subscription *ObjectType*. Describes entry point
             for fields to receive continuous updates.
+        types (Optional[List[Type[ObjectType]]]): List of any types to include in schema that
+            may not be introspected through root types.
         directives (List[GraphQLDirective], optional): List of custom directives to include in the
             GraphQL schema. Defaults to only include directives defined by GraphQL spec (@include
             and @skip) [GraphQLIncludeDirective, GraphQLSkipDirective].
-        types (List[GraphQLType], optional): List of any types to include in schema that
-            may not be introspected through root types.
         auto_camelcase (bool): Fieldnames will be transformed in Schema's TypeMap from snake_case
             to camelCase (preferred by GraphQL standard). Default True.
     """
@@ -440,13 +526,15 @@ class Schema:
         self.query = query
         self.mutation = mutation
         self.subscription = subscription
-        self.graphql_schema = GrapheneGraphQLSchema(
-            query,
-            mutation,
-            subscription,
-            types,
+        type_map = TypeMap(
+            query, mutation, subscription, types, auto_camelcase=auto_camelcase
+        )
+        self.graphql_schema = GraphQLSchema(
+            type_map.query,
+            type_map.mutation,
+            type_map.subscription,
+            type_map.types,
             directives,
-            auto_camelcase=auto_camelcase,
         )
 
     def __str__(self):
@@ -461,7 +549,7 @@ class Schema:
         """
         _type = self.graphql_schema.get_type(type_name)
         if _type is None:
-            raise AttributeError('Type "{}" not found in the Schema'.format(type_name))
+            raise AttributeError(f'Type "{type_name}" not found in the Schema')
         if isinstance(_type, GrapheneGraphQLType):
             return _type.graphene_type
         return _type
@@ -490,6 +578,8 @@ class Schema:
                 request_string, an operation name must be provided for the result to be provided.
             middleware (List[SupportsGraphQLMiddleware]): Supply request level middleware as
                 defined in `graphql-core`.
+            execution_context_class (ExecutionContext, optional): The execution context class
+                to use when resolving queries and mutations.
 
         Returns:
             :obj:`ExecutionResult` containing any data and errors for the operation.
@@ -504,6 +594,23 @@ class Schema:
         """
         kwargs = normalize_execute_kwargs(kwargs)
         return await graphql(self.graphql_schema, *args, **kwargs)
+
+    async def subscribe(self, query, *args, **kwargs):
+        """Execute a GraphQL subscription on the schema asynchronously."""
+        # Do parsing
+        try:
+            document = parse(query)
+        except GraphQLError as error:
+            return ExecutionResult(data=None, errors=[error])
+
+        # Do validation
+        validation_errors = validate(self.graphql_schema, document)
+        if validation_errors:
+            return ExecutionResult(data=None, errors=validation_errors)
+
+        # Execute the query
+        kwargs = normalize_execute_kwargs(kwargs)
+        return await subscribe(self.graphql_schema, document, *args, **kwargs)
 
     def introspect(self):
         introspection = self.execute(introspection_query)

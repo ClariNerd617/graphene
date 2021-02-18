@@ -30,7 +30,7 @@ Compare Graphene's *code-first* approach to building a GraphQL API with *schema-
 
 .. _Ariadne: https://ariadne.readthedocs.io
 
-Graphene is fully featured with integrations for the most popular web frameworks and ORMs. Graphene produces schemas tha are fully compliant with the GraphQL spec and provides tools and patterns for building a Relay-Compliant API as well.
+Graphene is fully featured with integrations for the most popular web frameworks and ORMs. Graphene produces schemas that are fully compliant with the GraphQL spec and provides tools and patterns for building a Relay-Compliant API as well.
 
 An example in Graphene
 ----------------------
@@ -103,7 +103,7 @@ For each **Field** in our **Schema**, we write a **Resolver** method to fetch da
 Schema Definition Language (SDL)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-In the `GraphQL Schema Definition Language`_, we could describe the fields defined by our example code as show below.
+In the `GraphQL Schema Definition Language`_, we could describe the fields defined by our example code as shown below.
 
 .. _GraphQL Schema Definition Language: https://graphql.org/learn/schema/
 
@@ -127,7 +127,7 @@ Then we can start querying our **Schema** by passing a GraphQL query string to `
     query_string = '{ hello }'
     result = schema.execute(query_string)
     print(result.data['hello'])
-    # "Hello stranger"
+    # "Hello stranger!"
 
     # or passing the argument in the query
     query_with_argument = '{ hello(name: "GraphQL") }'

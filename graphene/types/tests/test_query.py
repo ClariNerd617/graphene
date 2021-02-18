@@ -262,17 +262,14 @@ def test_query_input_field():
 
     result = test_schema.execute('{ test(aInput: {aField: "String!"} ) }', "Source!")
     assert not result.errors
-    assert result.data == {
-        "test": '["Source!",{"a_input":{"a_field":"String!","recursive_field":null}}]'
-    }
+    assert result.data == {"test": '["Source!",{"a_input":{"a_field":"String!"}}]'}
 
     result = test_schema.execute(
         '{ test(aInput: {recursiveField: {aField: "String!"}}) }', "Source!"
     )
     assert not result.errors
     assert result.data == {
-        "test": '["Source!",{"a_input":{"a_field":null,"recursive_field":'
-        '{"a_field":"String!","recursive_field":null}}}]'
+        "test": '["Source!",{"a_input":{"recursive_field":{"a_field":"String!"}}}]'
     }
 
 
@@ -408,7 +405,7 @@ def test_big_list_of_containers_multiple_fields_query_benchmark(benchmark):
 
 
 def test_big_list_of_containers_multiple_fields_custom_resolvers_query_benchmark(
-    benchmark
+    benchmark,
 ):
     class Container(ObjectType):
         x = Int()
@@ -457,15 +454,15 @@ def test_query_annotated_resolvers():
         info = String()
 
         def resolve_annotated(self, info, id):
-            return "{}-{}".format(self, id)
+            return f"{self}-{id}"
 
         def resolve_context(self, info):
             assert isinstance(info.context, Context)
-            return "{}-{}".format(self, info.context.key)
+            return f"{self}-{info.context.key}"
 
         def resolve_info(self, info):
             assert isinstance(info, ResolveInfo)
-            return "{}-{}".format(self, info.field_name)
+            return f"{self}-{info.field_name}"
 
     test_schema = Schema(Query)
 

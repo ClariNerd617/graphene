@@ -1,7 +1,12 @@
-from .base import BaseOptions, BaseType
+from .base import BaseOptions, BaseType, BaseTypeMeta
 from .field import Field
 from .interface import Interface
 from .utils import yank_fields_from_attrs
+
+try:
+    from dataclasses import make_dataclass, field
+except ImportError:
+    from ..pyutils.dataclasses import make_dataclass, field  # type: ignore
 
 # For static type checking with Mypy
 MYPY = False
@@ -14,7 +19,38 @@ class ObjectTypeOptions(BaseOptions):
     interfaces = ()  # type: Iterable[Type[Interface]]
 
 
-class ObjectType(BaseType):
+class ObjectTypeMeta(BaseTypeMeta):
+    def __new__(cls, name_, bases, namespace, **options):
+        # Note: it's safe to pass options as keyword arguments as they are still type-checked by ObjectTypeOptions.
+
+        # We create this type, to then overload it with the dataclass attrs
+        class InterObjectType:
+            pass
+
+        base_cls = super().__new__(
+            cls, name_, (InterObjectType,) + bases, namespace, **options,
+        )
+        if base_cls._meta:
+            fields = [
+                (
+                    key,
+                    "typing.Any",
+                    field(
+                        default=field_value.default_value
+                        if isinstance(field_value, Field)
+                        else None
+                    ),
+                )
+                for key, field_value in base_cls._meta.fields.items()
+            ]
+            dataclass = make_dataclass(name_, fields, bases=())
+            InterObjectType.__init__ = dataclass.__init__
+            InterObjectType.__eq__ = dataclass.__eq__
+            InterObjectType.__repr__ = dataclass.__repr__
+        return base_cls
+
+
+class ObjectType(BaseType, metaclass=ObjectTypeMeta):
     """
     Object Type Definition
 
@@ -93,7 +129,7 @@ class ObjectType(BaseType):
         possible_types=(),
         default_resolver=None,
         _meta=None,
-        **options
+        **options,
     ):
         if not _meta:
             _meta = ObjectTypeOptions(cls)
@@ -101,18 +137,18 @@ class ObjectType(BaseType):
         fields = {}
 
         for interface in interfaces:
-            assert issubclass(interface, Interface), (
-                'All interfaces of {} must be a subclass of Interface. Received "{}".'
-            ).format(cls.__name__, interface)
+            assert issubclass(
+                interface, Interface
+            ), f'All interfaces of {cls.__name__} must be a subclass of Interface. Received "{interface}".'
             fields.update(interface._meta.fields)
 
         for base in reversed(cls.__mro__):
             fields.update(yank_fields_from_attrs(base.__dict__, _as=Field))
 
         assert not (possible_types and cls.is_type_of), (
-            "{name}.Meta.possible_types will cause type collision with {name}.is_type_of. "
+            f"{cls.__name__}.Meta.possible_types will cause type collision with {cls.__name__}.is_type_of. "
             "Please use one or other."
-        ).format(name=cls.__name__)
+        )
 
         if _meta.fields:
             _meta.fields.update(fields)
@@ -127,45 +163,3 @@ class ObjectType(BaseType):
         super(ObjectType, cls).__init_subclass_with_meta__(_meta=_meta, **options)
 
     is_type_of = None
-
-    def __init__(self, *args, **kwargs):
-        # ObjectType acting as container
-        args_len = len(args)
-        fields = self._meta.fields.items()
-        if args_len > len(fields):
-            # Daft, but matches old exception sans the err msg.
-            raise IndexError("Number of args exceeds number of fields")
-        fields_iter = iter(fields)
-
-        if not kwargs:
-            for val, (name, field) in zip(args, fields_iter):
-                setattr(self, name, val)
-        else:
-            for val, (name, field) in zip(args, fields_iter):
-                setattr(self, name, val)
-                kwargs.pop(name, None)
-
-        for name, field in fields_iter:
-            try:
-                val = kwargs.pop(
-                    name, field.default_value if isinstance(field, Field) else None
-                )
-                setattr(self, name, val)
-            except KeyError:
-                pass
-
-        if kwargs:
-            for prop in list(kwargs):
-                try:
-                    if isinstance(
-                        getattr(self.__class__, prop), property
-                    ) or prop.startswith("_"):
-                        setattr(self, prop, kwargs.pop(prop))
-                except AttributeError:
-                    pass
-            if kwargs:
-                raise TypeError(
-                    "'{}' is an invalid keyword argument for {}".format(
-                        list(kwargs)[0], self.__class__.__name__
-                    )
-                )

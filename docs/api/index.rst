@@ -20,6 +20,8 @@ Object types
 .. autoclass:: graphene.Mutation
     :members:
 
+.. _fields-mounted-types:
+
 Fields (Mounted Types)
 ----------------------
 
@@ -61,6 +63,8 @@ Graphene Scalars
 .. autoclass:: graphene.UUID()
 
 .. autoclass:: graphene.JSONString()
+
+.. autoclass:: graphene.Base64()
 
 Enum
 ----

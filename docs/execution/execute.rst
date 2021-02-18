@@ -3,8 +3,7 @@
 Executing a query
 =================
 
-
-For executing a query a schema, you can directly call the ``execute`` method on it.
+For executing a query against a schema, you can directly call the ``execute`` method on it.
 
 
 .. code:: python
@@ -86,7 +85,7 @@ Value used for :ref:`ResolverParamParent` in root queries and mutations can be o
             return {'id': root.id, 'firstName': root.name}
 
     schema = Schema(Query)
-    user_root = User(id=12, name='bob'}
+    user_root = User(id=12, name='bob')
     result = schema.execute(
         '''
         query getUser {

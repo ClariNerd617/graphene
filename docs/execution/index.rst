@@ -8,3 +8,5 @@ Execution
    execute
    middleware
    dataloader
+   fileuploading
+   subscriptions

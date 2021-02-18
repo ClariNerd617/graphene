@@ -52,6 +52,7 @@ Resolvers are lazily executed, so if a field is not included in a query, its res
 Each field on an *ObjectType* in Graphene should have a corresponding resolver method to fetch data. This resolver method should match the field name. For example, in the ``Person`` type above, the ``full_name`` field is resolved by the method ``resolve_full_name``.
 
 Each resolver method takes the parameters:
+
 * :ref:`ResolverParamParent` for the value object use to resolve most fields
 * :ref:`ResolverParamInfo` for query and schema meta information and per-request context
 * :ref:`ResolverParamGraphQLArguments` as defined on the **Field**.
@@ -101,7 +102,7 @@ When we execute a query against that schema.
     query_string = "{ me { fullName } }"
     result = schema.execute(query_string)
 
-    assert result["data"]["me"] == {"fullName": "Luke Skywalker")
+    assert result.data["me"] == {"fullName": "Luke Skywalker"}
 
 Then we go through the following steps to resolve this query:
 
@@ -158,6 +159,22 @@ You can then execute the following query:
         }
     }
 
+*Note:* There are several arguments to a field that are "reserved" by Graphene
+(see :ref:`fields-mounted-types`).
+You can still define an argument that clashes with one of these fields by using
+the ``args`` parameter like so:
+
+.. code:: python
+
+    from graphene import ObjectType, Field, String
+
+    class Query(ObjectType):
+        answer = String(args={'description': String()})
+
+        def resolve_answer(parent, info, description):
+            return description
+
+
 Convenience Features of Graphene Resolvers
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -212,7 +229,7 @@ If the :ref:`ResolverParamParent` is a dictionary, the resolver will look for a 
 
     from graphene import ObjectType, String, Field, Schema
 
-    PersonValueObject = namedtuple('Person', 'first_name', 'last_name')
+    PersonValueObject = namedtuple("Person", ["first_name", "last_name"])
 
     class Person(ObjectType):
         first_name = String()
@@ -224,7 +241,7 @@ If the :ref:`ResolverParamParent` is a dictionary, the resolver will look for a 
 
         def resolve_me(parent, info):
             # always pass an object for `me` field
-            return PersonValueObject(first_name='Luke', last_name='Skywalker')
+            return PersonValueObject(first_name="Luke", last_name="Skywalker")
 
         def resolve_my_best_friend(parent, info):
             # always pass a dictionary for `my_best_fiend_field`
@@ -238,10 +255,10 @@ If the :ref:`ResolverParamParent` is a dictionary, the resolver will look for a 
         }
     ''')
     # With default resolvers we can resolve attributes from an object..
-    assert result['data']['me'] == {"firstName": "Luke", "lastName": "Skywalker"}
+    assert result.data["me"] == {"firstName": "Luke", "lastName": "Skywalker"}
 
     # With default resolvers, we can also resolve keys from a dictionary..
-    assert result['data']['my_best_friend'] == {"firstName": "R2", "lastName": "D2"}
+    assert result.data["myBestFriend"] == {"firstName": "R2", "lastName": "D2"}
 
 Advanced
 ~~~~~~~~
@@ -280,7 +297,7 @@ An error will be thrown:
 
     TypeError: resolve_hello() missing 1 required positional argument: 'name'
 
-You can fix this error in serveral ways. Either by combining all keyword arguments
+You can fix this error in several ways. Either by combining all keyword arguments
 into a dict:
 
 .. code:: python
@@ -331,7 +348,7 @@ A field can use a custom resolver from outside the class:
     from graphene import ObjectType, String
 
     def resolve_full_name(person, info):
-        return '{} {}'.format(person.first_name, person.last_name)
+        return f"{person.first_name} {person.last_name}"
 
     class Person(ObjectType):
         first_name = String()
